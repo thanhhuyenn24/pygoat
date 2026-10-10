@@ -17,7 +17,7 @@ env:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned: ubuntu-latest moves to Ubuntu 26 on 2026-10-19
     steps:
       - name: Check out application
         uses: actions/checkout@v6
@@ -68,6 +68,7 @@ jobs:
           python securitygate/gate-decision/gate.py layer2-report.json
           --context "$DEPLOYMENT_CONTEXT"
           --policy securitygate/gate-decision/policy.yaml
+          --root app
           --summary "$GITHUB_STEP_SUMMARY"
           --output gate-decision.json
 
