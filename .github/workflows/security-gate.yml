@@ -1,0 +1,83 @@
+# Security gate for this application. Copy to .github/workflows/security-gate.yml.
+# Needs repository secrets NVD_API_KEY and GATE_REPO_TOKEN (read access to securitygate-cicd).
+# Optional repository variables: GATE_REF (branch of securitygate-cicd, default branch if unset)
+# and DEPLOYMENT_CONTEXT (internet-facing or internal, default internet-facing).
+name: security-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OSV_SCANNER_VERSION: "2.6.0"
+  DEPLOYMENT_CONTEXT: ${{ vars.DEPLOYMENT_CONTEXT || 'internet-facing' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out application
+        uses: actions/checkout@v6
+        with:
+          path: app
+
+      - name: Check out security gate
+        uses: actions/checkout@v6
+        with:
+          repository: thanhhuyenn24/securitygate-cicd
+          ref: ${{ vars.GATE_REF }}
+          token: ${{ secrets.GATE_REPO_TOKEN }}
+          path: securitygate
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install gate dependencies
+        run: pip install -r securitygate/layer2-risk-engine/requirements.txt
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -sSfL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          chmod +x osv-scanner
+          ./osv-scanner --version
+
+      - name: Scan dependencies
+        run: |
+          set +e
+          ./osv-scanner scan source -r app --format json --output osv.json
+          status=$?
+          set -e
+          # 0 = no findings, 1 = findings; 127/128 mean the scan itself failed
+          if [ "$status" -gt 1 ]; then
+            echo "OSV-Scanner failed with exit code $status"
+            exit "$status"
+          fi
+
+      - name: Score findings (Layer 2)
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: python securitygate/layer2-risk-engine/src/osv_adapter.py osv.json --output layer2-report.json
+
+      - name: Gate decision
+        run: >-
+          python securitygate/gate-decision/gate.py layer2-report.json
+          --context "$DEPLOYMENT_CONTEXT"
+          --policy securitygate/gate-decision/policy.yaml
+          --summary "$GITHUB_STEP_SUMMARY"
+          --output gate-decision.json
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: security-gate-reports
+          path: |
+            osv.json
+            layer2-report.json
+            gate-decision.json
+          if-no-files-found: ignore
