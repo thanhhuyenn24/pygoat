@@ -1,7 +1,12 @@
 # Security gate for this application. Copy to .github/workflows/security-gate.yml.
-# Needs repository secrets NVD_API_KEY and GATE_REPO_TOKEN (read access to securitygate-cicd).
-# Optional repository variables: GATE_REF (branch of securitygate-cicd, default branch if unset)
-# and DEPLOYMENT_CONTEXT (internet-facing or internal, default internet-facing).
+# Needs repository secrets:
+#   GATE_REPO_TOKEN  read access to thanhhuyenn24/securitygate-cicd
+#   NVD_API_KEY      NVD API key (Layer 2 CVSS lookups; avoids low rate limit)
+#   HF_TOKEN         Hugging Face read token for the private model repo (Layer 1)
+# Optional repository variables:
+#   GATE_REF            branch of securitygate-cicd to use (default branch if unset)
+#   DEPLOYMENT_CONTEXT  internet-facing (default) or internal
+#   MODEL_REVISION      pin the CodeBERT model commit (defaults to the one baked into predict.py)
 name: security-gate
 
 on:
@@ -10,10 +15,13 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write   # post the gate result as a PR comment
 
 env:
   OSV_SCANNER_VERSION: "2.6.0"
+  GITLEAKS_VERSION: "8.21.2"
   DEPLOYMENT_CONTEXT: ${{ vars.DEPLOYMENT_CONTEXT || 'internet-facing' }}
+  MODEL_REVISION: ${{ vars.MODEL_REVISION || '9b5068b8dbf61f057e277ae24b56fc4356272130' }}
 
 jobs:
   gate:
@@ -38,7 +46,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install gate dependencies
-        run: pip install -r securitygate/layer2-risk-engine/requirements.txt
+        run: |
+          pip install -r securitygate/layer2-risk-engine/requirements.txt
+          pip install -r securitygate/layer1-nlp/requirements-inference.txt
+
+      # Cache the model by revision so only the first run downloads it (~500 MB).
+      - name: Cache CodeBERT model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-codebert-secret-${{ env.MODEL_REVISION }}
 
       - name: Install OSV-Scanner
         run: |
@@ -46,7 +63,37 @@ jobs:
           chmod +x osv-scanner
           ./osv-scanner --version
 
-      - name: Scan dependencies
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          ./gitleaks version
+
+      # ---- Layer 1: secret scanning + context-aware classification ----
+      - name: Scan secrets (Gitleaks)
+        run: |
+          set +e
+          ./gitleaks detect --source app --no-git --report-format json --report-path gitleaks.json
+          status=$?
+          set -e
+          # 0 = no leaks, 1 = leaks found (expected); >1 means Gitleaks itself failed
+          if [ "$status" -gt 1 ]; then
+            echo "Gitleaks failed with exit code $status"
+            exit "$status"
+          fi
+
+      - name: Classify secrets (Layer 1)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >-
+          python securitygate/layer1-nlp/src/predict.py gitleaks.json
+          --source app
+          --revision "$MODEL_REVISION"
+          --output secret-report.json
+
+      # ---- Layer 2: dependency CVE risk scoring ----
+      - name: Scan dependencies (OSV-Scanner)
         run: |
           set +e
           ./osv-scanner scan source -r app --format json --output osv.json
@@ -63,14 +110,38 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: python securitygate/layer2-risk-engine/src/osv_adapter.py osv.json --output layer2-report.json
 
+      # ---- Policy Matrix: combine both layers, decide PASS/WARN/BLOCK ----
       - name: Gate decision
+        id: gate
         run: >-
           python securitygate/gate-decision/gate.py layer2-report.json
+          --secret-report secret-report.json
           --context "$DEPLOYMENT_CONTEXT"
           --policy securitygate/gate-decision/policy.yaml
           --root app
           --summary "$GITHUB_STEP_SUMMARY"
           --output gate-decision.json
+
+      - name: Comment result on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## Security Gate\n_No report produced._';
+            try {
+              const r = JSON.parse(fs.readFileSync('gate-decision.json', 'utf8'));
+              const rows = r.findings.filter(f => f.decision !== 'PASS').slice(0, 30)
+                .map(f => `| ${f.decision} | ${f.layer} | ${f.package} | ${f.class} | ${f.reason.replace(/\|/g,'/')} |`)
+                .join('\n');
+              body = `## Security Gate: **${r.decision}**\n\n`
+                + `Context \`${r.context}\` — BLOCK ${r.counts.BLOCK}, WARN ${r.counts.WARN}, PASS ${r.counts.PASS}\n\n`
+                + (rows ? `| Decision | Layer | Package/File | Class | Reason |\n|---|---|---|---|---|\n${rows}` : '_No BLOCK/WARN findings._');
+            } catch (e) {}
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body,
+            });
 
       - name: Upload reports
         if: always()
@@ -78,6 +149,8 @@ jobs:
         with:
           name: security-gate-reports
           path: |
+            gitleaks.json
+            secret-report.json
             osv.json
             layer2-report.json
             gate-decision.json
