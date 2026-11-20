@@ -7,6 +7,18 @@
 #   GATE_REF            branch of securitygate-cicd to use (default branch if unset)
 #   DEPLOYMENT_CONTEXT  internet-facing (default) or internal
 #   MODEL_REVISION      pin the CodeBERT model commit (defaults to the one baked into predict.py)
+#   MODEL_SUBFOLDER     subfolder of the model repo to load (default "final": the production
+#                        model trained on all 53,708 samples; "fold{N}" are 5-fold CV checkpoints)
+#
+# Layout: Layer 1 (secrets) and Layer 2 (dependency CVE) run as independent parallel
+# jobs — they don't depend on each other's output, only `gate` needs both. Wall-clock
+# time is therefore ~max(layer1, layer2) + gate overhead instead of layer1 + layer2.
+#
+# CAUTION: gitleaks.json / secret-report.json are uploaded as artifacts and contain
+# the raw matched secret text. Anyone with read access to this repo's Actions runs
+# can download them. Acceptable for a deliberately-vulnerable app like PyGoat; for
+# a real application, restrict who can read Actions artifacts or stop uploading
+# gitleaks.json/secret-report.json (keep only the redacted gate-decision.json).
 name: security-gate
 
 on:
@@ -14,17 +26,22 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: write   # post the gate result as a PR comment
+  contents: read   # job-level `permissions:` below narrows/extends this per job
 
 env:
   OSV_SCANNER_VERSION: "2.6.0"
   GITLEAKS_VERSION: "8.21.2"
   DEPLOYMENT_CONTEXT: ${{ vars.DEPLOYMENT_CONTEXT || 'internet-facing' }}
-  MODEL_REVISION: ${{ vars.MODEL_REVISION || '9b5068b8dbf61f057e277ae24b56fc4356272130' }}
+  MODEL_REVISION: ${{ vars.MODEL_REVISION || 'f0e541ae85af2cda85de525cbe36bc34f12854a9' }}
+  MODEL_SUBFOLDER: ${{ vars.MODEL_SUBFOLDER || 'final' }}
+
+concurrency:
+  group: security-gate-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  gate:
+  # ---- Layer 1: secret scanning + context-aware classification ----
+  secrets-scan:
     runs-on: ubuntu-24.04  # pinned: ubuntu-latest moves to Ubuntu 26 on 2026-10-19
     steps:
       - name: Check out application
@@ -39,38 +56,48 @@ jobs:
           ref: ${{ vars.GATE_REF }}
           token: ${{ secrets.GATE_REPO_TOKEN }}
           path: securitygate
+          sparse-checkout: |
+            layer1-nlp
+            gate-decision
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: 'pip'
+          cache-dependency-path: securitygate/layer1-nlp/requirements-inference.txt
 
       - name: Install gate dependencies
-        run: |
-          pip install -r securitygate/layer2-risk-engine/requirements.txt
-          pip install -r securitygate/layer1-nlp/requirements-inference.txt
+        run: pip install -r securitygate/layer1-nlp/requirements-inference.txt
 
-      # Cache the model by revision so only the first run downloads it (~500 MB).
+      # Cache the model by revision so only the first run per cache generation downloads it (~500 MB).
       - name: Cache CodeBERT model
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
           key: hf-codebert-secret-${{ env.MODEL_REVISION }}
 
-      - name: Install OSV-Scanner
-        run: |
-          curl -sSfL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
-          chmod +x osv-scanner
-          ./osv-scanner --version
+      - name: Cache Gitleaks binary
+        id: cache-gitleaks
+        uses: actions/cache@v4
+        with:
+          path: gitleaks
+          key: gitleaks-${{ env.GITLEAKS_VERSION }}-linux_x64
 
       - name: Install Gitleaks
+        if: steps.cache-gitleaks.outputs.cache-hit != 'true'
         run: |
-          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          tar -xzf gitleaks.tar.gz gitleaks
+          # keep the release's original filename: sha256sum -c matches entries by name,
+          # and with --ignore-missing a renamed file would mean nothing gets verified (exit 1)
+          curl -sSfL -O "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL -o checksums.txt "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
           chmod +x gitleaks
-          ./gitleaks version
 
-      # ---- Layer 1: secret scanning + context-aware classification ----
+      - name: Verify Gitleaks
+        run: ./gitleaks version
+
       - name: Scan secrets (Gitleaks)
         run: |
           set +e
@@ -90,9 +117,65 @@ jobs:
           python securitygate/layer1-nlp/src/predict.py gitleaks.json
           --source app
           --revision "$MODEL_REVISION"
+          --subfolder "$MODEL_SUBFOLDER"
           --output secret-report.json
 
-      # ---- Layer 2: dependency CVE risk scoring ----
+      - name: Upload secret report
+        if: always()  # e.g. classify step fails on a missing HF_TOKEN: still keep gitleaks.json for debugging
+        uses: actions/upload-artifact@v6
+        with:
+          name: layer1-secret-report
+          path: |
+            gitleaks.json
+            secret-report.json
+          if-no-files-found: ignore
+
+  # ---- Layer 2: dependency CVE risk scoring ----
+  deps-scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out application
+        uses: actions/checkout@v6
+        with:
+          path: app
+
+      - name: Check out security gate
+        uses: actions/checkout@v6
+        with:
+          repository: thanhhuyenn24/securitygate-cicd
+          ref: ${{ vars.GATE_REF }}
+          token: ${{ secrets.GATE_REPO_TOKEN }}
+          path: securitygate
+          sparse-checkout: |
+            layer2-risk-engine
+            gate-decision
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+          cache-dependency-path: securitygate/layer2-risk-engine/requirements.txt
+
+      - name: Install gate dependencies
+        run: pip install -r securitygate/layer2-risk-engine/requirements.txt
+
+      - name: Cache OSV-Scanner binary
+        id: cache-osv
+        uses: actions/cache@v4
+        with:
+          path: osv-scanner
+          key: osv-scanner-${{ env.OSV_SCANNER_VERSION }}-linux_amd64
+
+      - name: Install OSV-Scanner
+        if: steps.cache-osv.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          chmod +x osv-scanner
+
+      - name: Verify OSV-Scanner
+        run: ./osv-scanner --version
+
       - name: Scan dependencies (OSV-Scanner)
         run: |
           set +e
@@ -110,7 +193,60 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: python securitygate/layer2-risk-engine/src/osv_adapter.py osv.json --output layer2-report.json
 
-      # ---- Policy Matrix: combine both layers, decide PASS/WARN/BLOCK ----
+      - name: Upload dependency report
+        if: always()  # e.g. scoring step fails on an NVD outage: still keep osv.json for debugging
+        uses: actions/upload-artifact@v6
+        with:
+          name: layer2-dependency-report
+          path: |
+            osv.json
+            layer2-report.json
+          if-no-files-found: ignore
+
+  # ---- Policy Matrix: combine both layers, decide PASS/WARN/BLOCK ----
+  gate:
+    needs: [secrets-scan, deps-scan]
+    if: always()  # still need to decide/comment even if one layer step failed
+    permissions:
+      contents: read
+      pull-requests: write   # post the gate result as a PR comment
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out application
+        uses: actions/checkout@v6
+        with:
+          path: app
+
+      - name: Check out security gate
+        uses: actions/checkout@v6
+        with:
+          repository: thanhhuyenn24/securitygate-cicd
+          ref: ${{ vars.GATE_REF }}
+          token: ${{ secrets.GATE_REPO_TOKEN }}
+          path: securitygate
+          sparse-checkout: |
+            gate-decision
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # No continue-on-error: if a layer's job failed to produce its artifact,
+      # this step fails here with a clear message instead of gate.py crashing
+      # later on a missing secret-report.json/layer2-report.json (gate.py always
+      # treats --secret-report as "present" once the flag is passed, regardless
+      # of whether the file actually exists).
+      - name: Download Layer 1 report
+        uses: actions/download-artifact@v6
+        with:
+          name: layer1-secret-report
+
+      - name: Download Layer 2 report
+        uses: actions/download-artifact@v6
+        with:
+          name: layer2-dependency-report
+
       - name: Gate decision
         id: gate
         run: >-
@@ -143,15 +279,10 @@ jobs:
               issue_number: context.issue.number, body,
             });
 
-      - name: Upload reports
+      - name: Upload final gate decision
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: security-gate-reports
-          path: |
-            gitleaks.json
-            secret-report.json
-            osv.json
-            layer2-report.json
-            gate-decision.json
+          name: security-gate-decision
+          path: gate-decision.json
           if-no-files-found: ignore
