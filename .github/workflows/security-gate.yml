@@ -232,6 +232,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # gate.py's only third-party import is yaml (policy.yaml parsing)
+      - name: Install gate dependencies
+        run: pip install pyyaml
+
       # No continue-on-error: if a layer's job failed to produce its artifact,
       # this step fails here with a clear message instead of gate.py crashing
       # later on a missing secret-report.json/layer2-report.json (gate.py always
